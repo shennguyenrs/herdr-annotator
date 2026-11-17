@@ -388,6 +388,19 @@ impl Cache {
     }
 }
 
+pub fn pr_base(dir: &Path, scope: &Scope, branch: Option<&str>) -> Option<(String, String)> {
+    let branch = branch?;
+    let mut cache = Cache::open(dir, scope, Some(branch)).ok()?;
+    if cache.doc.attempted_at == 0 {
+        let _ = cache.refresh(scope, Some(branch), false);
+    }
+    cache
+        .doc
+        .pull_request
+        .as_ref()
+        .map(|pr| (pr.base_remote.clone(), pr.base.clone()))
+}
+
 pub fn mark_read(dir: &Path, scope: &Scope, thread: &ThreadRef, read: bool) -> Result<GithubView> {
     let scope = git::canonical_scope(scope)?;
     let branch = git::git(&scope, &["symbolic-ref", "--short", "-q", "HEAD"])?;
@@ -529,7 +542,7 @@ fn fetch(
     branch: Option<&str>,
 ) -> Result<(Option<PullRequest>, Vec<GithubThread>, bool)> {
     let branch = branch.ok_or("GitHub threads require a named branch, not detached HEAD")?;
-    let remote = |name| {
+    let remote = |name: &str| {
         git::git(scope, &["remote", "get-url", name])
             .ok()
             .filter(|o| o.code == 0)
@@ -541,28 +554,52 @@ fn fetch(
         .as_ref()
         .or(origin.as_ref())
         .ok_or("No supported github.com origin/upstream remote")?;
-    let head_repo = origin.as_ref().unwrap_or(base_repo);
+    let tracked_remote = git::git(scope, &["config", "--get", &format!("branch.{branch}.remote")])
+        .ok()
+        .filter(|o| o.code == 0)
+        .map(|o| o.text.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .and_then(|name| remote(&name));
+    let mut head_repo = tracked_remote
+        .as_ref()
+        .or(origin.as_ref())
+        .unwrap_or(base_repo);
+    let query_prs = |owner: &str| -> Result<Vec<Value>> {
+        let prs = gh(&[
+            "api".into(),
+            "--hostname".into(),
+            "github.com".into(),
+            "--method".into(),
+            "GET".into(),
+            format!("repos/{base_repo}/pulls"),
+            "-f".into(),
+            "state=open".into(),
+            "-f".into(),
+            format!("head={owner}:{branch}"),
+            "-f".into(),
+            "per_page=2".into(),
+        ])?;
+        Ok(prs
+            .as_array()
+            .ok_or("Invalid GitHub pull request response")?
+            .clone())
+    };
     let head_owner = head_repo
         .split('/')
         .next()
         .ok_or("Invalid head repository")?;
-    let prs = gh(&[
-        "api".into(),
-        "--hostname".into(),
-        "github.com".into(),
-        "--method".into(),
-        "GET".into(),
-        format!("repos/{base_repo}/pulls"),
-        "-f".into(),
-        "state=open".into(),
-        "-f".into(),
-        format!("head={head_owner}:{branch}"),
-        "-f".into(),
-        "per_page=2".into(),
-    ])?;
-    let prs = prs
-        .as_array()
-        .ok_or("Invalid GitHub pull request response")?;
+    let mut prs = query_prs(head_owner)?;
+    if prs.is_empty() && head_repo != base_repo {
+        let base_owner = base_repo
+            .split('/')
+            .next()
+            .ok_or("Invalid base repository")?;
+        let fallback_prs = query_prs(base_owner)?;
+        if !fallback_prs.is_empty() {
+            head_repo = base_repo;
+            prs = fallback_prs;
+        }
+    }
     if prs.is_empty() {
         return Ok((None, vec![], false));
     }

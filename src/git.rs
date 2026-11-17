@@ -111,10 +111,13 @@ pub(crate) fn canonical_scope(scope: &Scope) -> Result<Scope> {
     })
 }
 
-fn automatic_develop(scope: &Scope, bases: &[String]) -> Result<String> {
-    if bases.iter().any(|base| base == "origin/develop") {
-        let local = git(scope, &["merge-base", "develop", "HEAD"])?;
-        let remote = git(scope, &["merge-base", "origin/develop", "HEAD"])?;
+fn automatic_ref(scope: &Scope, bases: &[String], local_name: &str, remote_name: &str) -> Result<String> {
+    if bases.iter().any(|base| base == remote_name) {
+        if !bases.iter().any(|base| base == local_name) {
+            return Ok(remote_name.into());
+        }
+        let local = git(scope, &["merge-base", local_name, "HEAD"])?;
+        let remote = git(scope, &["merge-base", remote_name, "HEAD"])?;
         if remote.code == 0
             && (local.code != 0
                 || (local.text != remote.text
@@ -130,13 +133,48 @@ fn automatic_develop(scope: &Scope, bases: &[String]) -> Result<String> {
                     .code
                         == 0))
         {
-            return Ok("origin/develop".into());
+            return Ok(remote_name.into());
         }
     }
-    Ok("develop".into())
+    Ok(local_name.into())
+}
+
+fn pr_automatic_base(
+    state_dir: Option<&std::path::Path>,
+    scope: &Scope,
+    branch: Option<&str>,
+    bases: &[String],
+) -> Result<Option<String>> {
+    let Some(dir) = state_dir else {
+        return Ok(None);
+    };
+    let Some((remote, base_branch)) = crate::github::pr_base(dir, scope, branch) else {
+        return Ok(None);
+    };
+    let remote_ref = format!("{remote}/{base_branch}");
+    let has_remote = bases.iter().any(|b| b == &remote_ref);
+    let has_local = bases.iter().any(|b| b == &base_branch) && branch != Some(base_branch.as_str());
+    if !has_remote && !has_local {
+        return Ok(None);
+    }
+    if has_remote && !has_local {
+        return Ok(Some(remote_ref));
+    }
+    if has_local && !has_remote {
+        return Ok(Some(base_branch));
+    }
+    Ok(Some(automatic_ref(scope, bases, &base_branch, &remote_ref)?))
 }
 
 pub fn snapshot(scope: &Scope, view: &ViewSpec) -> Result<Snapshot> {
+    snapshot_with_state(None, scope, view)
+}
+
+pub fn snapshot_with_state(
+    state_dir: Option<&std::path::Path>,
+    scope: &Scope,
+    view: &ViewSpec,
+) -> Result<Snapshot> {
     if view.context > 1_000_000 {
         return Err("Context must be between 0 and 1000000 lines".into());
     }
@@ -164,11 +202,13 @@ pub fn snapshot(scope: &Scope, view: &ViewSpec) -> Result<Snapshot> {
         }
         let base = if let Some(base) = &scope.comparison.base {
             base.clone()
+        } else if let Some(pr_base) = pr_automatic_base(state_dir, &scope, branch.as_deref(), &bases)? {
+            pr_base
         } else if bases.iter().any(|base| base == "develop") {
             // Either local or remote-tracking develop may be stale. Prefer the
             // one whose common ancestor is closer to HEAD, never upstream work
             // already present when the feature branch was created. No fetch.
-            automatic_develop(&scope, &bases)?
+            automatic_ref(&scope, &bases, "develop", "origin/develop")?
         } else {
             let remote_head = git(
                 &scope,

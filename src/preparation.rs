@@ -13,7 +13,7 @@ pub(crate) struct PreparedReview {
 
 impl PreparedReview {
     pub fn open(state_dir: &Path, scope: &Scope, view: &ViewSpec) -> Result<(Self, Store)> {
-        let mut visible = git::snapshot(scope, view)?;
+        let mut visible = git::snapshot_with_state(Some(state_dir), scope, view)?;
         let store = Store::open(state_dir, &visible.scope)?;
         let paths = store
             .comments
