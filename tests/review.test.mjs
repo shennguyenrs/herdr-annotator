@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { selectionFor, selectionPayload, selected, inlineAt, pendingComments, sessionTarget, fileStats, pathParts, commentStatus, commentLocation, reviewSummary, sendHint, visibleComments, unreadItems, snapshotFailure, diffReaderEntries, splitRows, contextGaps, reviewTargetReady, reviewTotals, editorLine, editorArgs } from "../mods/annotator/review.js";
+import { selectionFor, selectionPayload, selected, inlineAt, pendingComments, sessionTarget, fileStats, pathParts, buildFileTree, flattenFileTree, treeFileOrder, commentStatus, commentLocation, reviewSummary, sendHint, visibleComments, unreadItems, snapshotFailure, diffReaderEntries, splitRows, contextGaps, reviewTargetReady, reviewTotals, editorLine, editorArgs } from "../mods/annotator/review.js";
 
 test("VS Code opens the selected or first changed line, remotely through Remote-SSH", () => {
   const file = { rows: [{ kind: "hunk" }, { kind: "context", old: 4, new: 4 }, { kind: "add", new: 5 }] };
@@ -178,4 +178,45 @@ test("file statistics and comment locations make anchors legible", () => {
   assert.equal(commentLocation({ position: { side: "new", start: 2, end: 4 } }), "L2–4");
   assert.equal(commentLocation({ stale: true, anchor: { lines: { selection: { side: "old", start: 3, end: 3 } } } }), "Was old L3");
   assert.equal(commentLocation({ position: null }), "File comment");
+});
+
+test("file tree compacts single-child folders, preserves logical order when requested, and summarizes collapsed branches", () => {
+  const files = [
+    { path: "README.md" },
+    { path: "src/payments/settlement.ts" },
+    { path: "src/payments/fees.ts" },
+    { path: "src/app/main.ts" },
+    { path: "tests/unit/fees.test.ts" },
+  ];
+  const tree = buildFileTree(files);
+  const rows = flattenFileTree(tree, new Set(["tests/unit"]), path => path.endsWith("fees.ts") || path.endsWith("fees.test.ts") ? 2 : 0, new Set(["tests/unit/fees.test.ts"]));
+  assert.deepEqual(rows.map(r => [r.kind, r.depth, r.kind === "dir" ? r.label : r.name, r.key]), [
+    ["dir", 0, "src", "/src"],
+    ["dir", 1, "app", "/src/app"],
+    ["file", 2, "main.ts", "src/app/main.ts"],
+    ["dir", 1, "payments", "/src/payments"],
+    ["file", 2, "fees.ts", "src/payments/fees.ts"],
+    ["file", 2, "settlement.ts", "src/payments/settlement.ts"],
+    ["dir", 0, "tests/unit", "/tests/unit"],
+    ["file", 0, "README.md", "README.md"],
+  ]);
+  const collapsedDir = rows.find(r => r.key === "/tests/unit");
+  assert.equal(collapsedDir.collapsed, true);
+  assert.equal(collapsedDir.commentCount, 2);
+  assert.equal(collapsedDir.hasDraft, true);
+  assert.deepEqual(treeFileOrder(tree).map(f => f.path), [
+    "src/app/main.ts", "src/payments/fees.ts", "src/payments/settlement.ts", "tests/unit/fees.test.ts", "README.md",
+  ]);
+  const logical = buildFileTree([
+    { path: "tests/unit/fees.test.ts" },
+    { path: "src/payments/settlement.ts" },
+    { path: "README.md" },
+    { path: "src/payments/fees.ts" },
+  ], true);
+  assert.deepEqual(treeFileOrder(logical).map(f => f.path), [
+    "tests/unit/fees.test.ts", "src/payments/settlement.ts", "src/payments/fees.ts", "README.md",
+  ]);
+  const mixed = buildFileTree([{ path: "foo" }, { path: "foo/bar" }]);
+  const mixedKeys = flattenFileTree(mixed, new Set(), () => 0, new Set()).map(r => r.key);
+  assert.equal(new Set(mixedKeys).size, 3);
 });

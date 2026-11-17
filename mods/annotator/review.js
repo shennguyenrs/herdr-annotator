@@ -155,6 +155,86 @@ export function pathParts(path) {
   return { name: parts.pop(), folder: parts.join("/") };
 }
 
+function compareTreeNames(a, b) {
+  const al = a.toLowerCase(), bl = b.toLowerCase();
+  return al < bl ? -1 : al > bl ? 1 : a < b ? -1 : a > b ? 1 : 0;
+}
+
+// Group changed paths into a folder tree, compacting single-child directories
+// while keeping Git order (folders first) or logical reading order.
+export function buildFileTree(files, ordered = false) {
+  const root = { label: "", path: "", dirs: new Map(), files: [], rank: Infinity };
+  files.forEach((file, index) => {
+    const parts = file.path.split("/").filter(Boolean);
+    const name = parts.pop() ?? file.path;
+    let node = root, prefix = "";
+    for (const segment of parts) {
+      prefix = prefix ? `${prefix}/${segment}` : segment;
+      let child = node.dirs.get(segment);
+      if (!child) {
+        child = { label: segment, path: prefix, dirs: new Map(), files: [], rank: index };
+        node.dirs.set(segment, child);
+      }
+      node = child;
+    }
+    node.files.push({ name, file, rank: index });
+  });
+  const finalize = (node, isRoot) => {
+    while (!isRoot && node.files.length === 0 && node.dirs.size === 1) {
+      const [only] = node.dirs.values();
+      node = { label: `${node.label}/${only.label}`, path: only.path, dirs: only.dirs, files: only.files, rank: only.rank };
+    }
+    const dirs = [...node.dirs.values()].map(dir => finalize(dir, false));
+    const leafFiles = node.files.map(entry => ({ kind: "file", name: entry.name, file: entry.file, rank: entry.rank }));
+    if (ordered) {
+      return { kind: "dir", label: node.label, path: node.path, rank: node.rank,
+        items: [...dirs, ...leafFiles].sort((a, b) => a.rank - b.rank) };
+    }
+    dirs.sort((a, b) => compareTreeNames(a.label, b.label));
+    leafFiles.sort((a, b) => compareTreeNames(a.name, b.name));
+    return { kind: "dir", label: node.label, path: node.path, rank: node.rank, items: [...dirs, ...leafFiles] };
+  };
+  return finalize(root, true);
+}
+
+export function flattenFileTree(tree, collapsed, count, draftPaths) {
+  const rows = [];
+  const walk = (items, depth, collect) => {
+    let commentCount = 0, hasDraft = false;
+    for (const item of items) {
+      if (item.kind === "file") {
+        const comments = count(item.file.path), draft = draftPaths.has(item.file.path);
+        commentCount += comments;
+        if (draft) hasDraft = true;
+        if (collect) rows.push({ kind: "file", key: item.file.path, name: item.name, file: item.file, depth, commentCount: comments, draft });
+      } else {
+        const isCollapsed = collapsed.has(item.path);
+        const row = collect ? { kind: "dir", key: `/${item.path}`, label: item.label, path: item.path, depth, collapsed: isCollapsed, commentCount: 0, hasDraft: false } : null;
+        if (row) rows.push(row);
+        const sub = walk(item.items, depth + 1, collect && !isCollapsed);
+        if (row) { row.commentCount = sub.commentCount; row.hasDraft = sub.hasDraft; }
+        commentCount += sub.commentCount;
+        if (sub.hasDraft) hasDraft = true;
+      }
+    }
+    return { commentCount, hasDraft };
+  };
+  walk(tree.items, 0, true);
+  return rows;
+}
+
+export function treeFileOrder(tree) {
+  const files = [];
+  const walk = items => {
+    for (const item of items) {
+      if (item.kind === "file") files.push(item.file);
+      else walk(item.items);
+    }
+  };
+  walk(tree.items);
+  return files;
+}
+
 export function commentStatus(comment) {
   if (comment.resolved) return { label: "Resolved", tone: "dim" };
   if (comment.delivery === "uncertain") return { label: "Check delivery", tone: "ansi3" };

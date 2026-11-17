@@ -1988,3 +1988,107 @@ test("keyboard review delivery accepts working but not blocked or unreported sou
     assert.equal(h.requests.some(request => request.op === "send"), status === "working", String(status));
   }
 });
+
+for (const full of [false, true]) test(`${full ? "full" : "sidebar"} switches between list and tree file views and persists across views`, async () => {
+  const h = harness(); h.state.props = full ? { presentation: "full" } : {};
+  const files = () => [
+    { path: "README.md", status: "M", rows: [], loaded: true },
+    { path: "src/payments/fees.ts", status: "M", rows: [{ kind: "add", new: 1, text: "fee" }], loaded: true },
+    { path: "src/payments/settlement.ts", status: "A", rows: [], loaded: true },
+  ];
+  const comments = [{ id: "c1", path: "src/payments/fees.ts", body: "Check fee", stale: false, resolved: false, delivery: null, position: null }];
+  h.state.reply = () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: {
+    snapshot: { scope: { ...h.state.scope }, branch: "main", head: "head1", revision: h.state.revision, files: files(), limited: false },
+    comments,
+  } }) });
+  h.mod.init({}, h.cx); await h.drain();
+  h.mod.open = "README.md";
+  h.mod.editor.set_value("Keep this draft");
+  h.mod.render(h.cx);
+  const listId = full ? "full-files" : "review-files-list";
+  const prefix = full ? "full-file-view" : "sidebar-file-view";
+  assert.equal(h.mod.fileView, "list");
+  assert.equal(h.state.virtual.id, listId);
+  assert.equal(h.nodes.some(n => n.id === `${prefix}-tree`), false);
+
+  openFullOptions(h);
+  const beforeRequests = h.requests.length;
+  h.nodes.find(n => n.id === `${prefix}-tree`).events.on_click({}, h.cx);
+  assert.equal(h.mod.fileView, "tree");
+  assert.equal(h.state.shared["annotator.fileView"], "tree");
+  assert.equal(h.requests.length, beforeRequests, "switching file view must not call Git or send");
+  assert.equal(h.mod.open, "README.md");
+  assert.equal(h.mod.editor.value(), "Keep this draft");
+
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.equal(h.state.virtual.id, `${listId}-tree`);
+  assert.equal(h.state.virtual.count, 4);
+  assert.equal(h.state.virtual.key(0), "/src/payments");
+  assert.equal(h.state.virtual.key(3), "README.md");
+
+  // Collapse folder, verify row hides children and shows comment count badge, and folder right-click opens no file menu.
+  h.nodes.find(n => n.id === `${listId}-tree`).events.on_item_click("/src/payments", h.cx);
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.equal(h.state.virtual.count, 2);
+  h.nodes.find(n => n.id === `${listId}-tree`).events.on_item_secondary_click("/src/payments", {}, h.cx);
+  assert.equal(h.mod.fileMenu, null);
+  const dirStart = h.nodes.length;
+  h.state.virtual.render({ start: 0, end: 2 });
+  assert.ok(h.nodes.slice(dirStart).some(n => n.id === "dir-src/payments"));
+  assert.ok(h.nodes.slice(dirStart).some(n => n.children.includes("1")));
+
+  if (full) {
+    // Navigating to previous file in tree order auto-expands its collapsed ancestor folder.
+    h.nodes.find(n => n.id === "full-prev-file").events.on_click({}, h.cx);
+    await h.drain();
+    assert.equal(h.mod.open, "src/payments/settlement.ts");
+  } else {
+    h.mod.selectFile("src/payments/settlement.ts", h.cx);
+    await h.drain();
+  }
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.equal(h.state.virtual.count, 4);
+
+  // Right-click on a file in tree mode opens the file menu.
+  h.nodes.find(n => n.id === `${listId}-tree`).events.on_item_secondary_click("src/payments/fees.ts", {}, h.cx);
+  h.nodes.find(n => n.id === `${listId}-frame`).events.on_mouse_down({ local_position: { x: 30, y: 56 } });
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.ok(h.nodes.some(n => n.id === `${listId}-menu`));
+  h.nodes.find(n => n.id === "file-menu-copy-path").events.on_click(null, h.cx);
+  assert.equal(h.state.clipboard, "src/payments/fees.ts");
+
+  // Reloading in the opposite presentation inherits the saved tree preference.
+  const other = harness();
+  other.state.shared = JSON.parse(JSON.stringify(h.state.shared));
+  other.state.props = full ? {} : { presentation: "full" };
+  other.mod.init({}, other.cx); await other.drain();
+  assert.equal(other.mod.fileView, "tree");
+
+  // Switch back to list view.
+  h.nodes.length = 0; h.mod.render(h.cx);
+  h.nodes.find(n => n.id === `${prefix}-list`).events.on_click({}, h.cx);
+  assert.equal(h.mod.fileView, "list");
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.equal(h.state.virtual.id, listId);
+});
+
+test("tree view builds only visible rows for large file lists and invalid preference falls back to list", async () => {
+  const h = harness();
+  h.state.shared["annotator.fileView"] = "invalid";
+  h.mod.init({}, h.cx); await h.drain();
+  assert.equal(h.mod.fileView, "list");
+  h.mod.setFileView("tree", h.cx);
+  h.mod.data.snapshot.files = Array.from({ length: 5000 }, (_, i) => ({
+    path: `src/dir/file-${i}.rs`, status: "M", rows: [], loaded: false,
+  }));
+  let built = 0;
+  const treeRow = h.mod.treeRow.bind(h.mod);
+  h.mod.treeRow = (...args) => { built++; return treeRow(...args); };
+  h.mod.render(h.cx);
+  assert.equal(built, 0, "offscreen tree rows must not be built in render()");
+  assert.equal(h.state.virtual.count, 5001);
+  const start = h.nodes.length;
+  h.state.virtual.render({ start: 0, end: 10 });
+  assert.equal(built, 10);
+  assert.ok(h.nodes.slice(start).every(n => !n.events.on_click), "deferred native tree rows cannot register handlers");
+});

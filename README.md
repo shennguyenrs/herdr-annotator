@@ -75,7 +75,7 @@ saves and sends, or opens confirmation and submits it.
 The comparison select offers **Uncommitted**, **Last commit**, and **Branch**.
 In full review it sits in the top bar, beside **View options**. In Branch mode,
 the base branch sits beside it (below it in the sidebar).
-**View options** groups file ordering, comment filters and code settings;
+**View options** groups file list/tree view, file ordering, comment filters and code settings;
 **File ▾** holds context expansion, file comments, copy and ask actions.
 
 After confirmed delivery, sent comments disappear from lists, diffs, and badges.

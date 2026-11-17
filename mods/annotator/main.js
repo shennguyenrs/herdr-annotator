@@ -1,7 +1,7 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, v_resizable, resizable_panel, v_virtual_list, Scrollbar, TextareaState, Textarea, TextView, InputState, Input, Select, Popup } from "gpui-base";
 import { spaces, panes, focused, agents, exec, home, props, theme, settings, shared, setShared, run, layout, appHome, watchFolder, machines, nextCommand } from "herdr";
-import { selectionFor, selectionPayload, selected, inlineAt, pendingComments, sessionTarget, fileStats, pathParts, commentStatus, commentLocation, reviewSummary, sendHint, unreadItems, visibleComments, layoutSidebar, reviewSidebarTransition, fullPreferences, snapshotFailure, needsFreshSnapshot, savedBaseChoice } from "./review.js";
+import { selectionFor, selectionPayload, selected, inlineAt, pendingComments, sessionTarget, fileStats, pathParts, buildFileTree, flattenFileTree, commentStatus, commentLocation, reviewSummary, sendHint, unreadItems, visibleComments, layoutSidebar, reviewSidebarTransition, fullPreferences, snapshotFailure, needsFreshSnapshot, savedBaseChoice } from "./review.js";
 import { renderFull } from "./full.js";
 import { highlightDiff } from "./syntax.js";
 import { DraftLifecycle } from "./draft.js";
@@ -32,6 +32,7 @@ export default class Annotator extends View {
     this.navigationDrafts = new Map(); this.navigationFiles = new Map();
     this.reviewNotes = new Map();
     this.reviewSend = null; this.reviewOptionsOpen = false; this.fileActionsOpen = false;
+    this.collapsedDirs = new Map(); this._fileTreeCache = null;
     this.githubDrafts = new Map();
     this.full = props()?.presentation === "full"; this.onlyUnread = false;
     const preferences = this.fullSettings();
@@ -1009,25 +1010,101 @@ export default class Annotator extends View {
     cx.notify();
   }
 
+  get fileView() { return shared("annotator.fileView") === "tree" ? "tree" : "list"; }
+
+  setFileView(view, cx) {
+    const next = view === "tree" ? "tree" : "list";
+    if (next === this.fileView) return;
+    setShared("annotator.fileView", next);
+    this.fileMenu = null;
+    if (next === "tree" && this.open) this.expandFileAncestors(this.open);
+    cx.notify();
+  }
+
+  fileViewToggle(prefix) {
+    const tree = this.fileView === "tree";
+    return h_flex().gap(3).items_center()
+      .child(this.button(`${prefix}-list`, "List", cx => this.setFileView("list", cx), true, !tree ? "secondary" : "quiet"))
+      .child(this.button(`${prefix}-tree`, "Tree", cx => this.setFileView("tree", cx), true, tree ? "secondary" : "quiet"));
+  }
+
+  collapsedSet() {
+    const key = this.comparisonKey();
+    let set = this.collapsedDirs.get(key);
+    if (!set) { set = new Set(); this.collapsedDirs.set(key, set); }
+    return set;
+  }
+
+  toggleDir(path, cx) {
+    const collapsed = this.collapsedSet();
+    if (collapsed.has(path)) collapsed.delete(path);
+    else collapsed.add(path);
+    this.fileMenu = null;
+    cx.notify();
+  }
+
+  expandFileAncestors(path) {
+    if (!path) return;
+    const collapsed = this.collapsedDirs.get(this.comparisonKey());
+    if (!collapsed?.size) return;
+    const parts = path.split("/");
+    parts.pop();
+    let prefix = "";
+    for (const part of parts) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      collapsed.delete(prefix);
+    }
+  }
+
+  fileTree(files) {
+    const ordered = Boolean(this.orderEntry()?.files);
+    const cache = this._fileTreeCache;
+    if (cache && cache.ordered === ordered && cache.files.length === files.length
+      && cache.files.every((file, index) => file === files[index])) {
+      return cache.tree;
+    }
+    const tree = buildFileTree(files, ordered);
+    this._fileTreeCache = { ordered, files, tree };
+    return tree;
+  }
+
   // File rows with a right-click menu. Deferred rows cannot hold handlers, so
   // the list reports the row and the wrapper the press position.
   fileList(id, files, count, draftPaths, t) {
+    const tree = this.fileView === "tree";
+    const rows = tree ? flattenFileTree(this.fileTree(files), this.collapsedSet(), count, draftPaths) : null;
+    const byKey = rows ? new Map(rows.map(row => [row.key, row])) : null;
+    const listId = tree ? `${id}-tree` : id;
     const menu = this.fileMenu?.list === id ? files.find(f => f.path === this.fileMenu.path) : null;
     const item = (key, label, action, enabled = true) => h_flex().id(`file-menu-${key}`).h(28).px(10).items_center().rounded(5).text_size(12)
       .text_color(enabled ? t.foreground : t.dim)
       .when(enabled, el => el.cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => { this.fileMenu = null; action(cx); }))
       .child(label);
-    return v_flex().id(`${id}-frame`).relative().size_full().min_h(0)
-      .on_mouse_down("left", (_e, cx) => { if (this.fileMenu) { this.fileMenu = null; cx.notify(); } })
-      .on_mouse_down("right", event => { if (this.fileMenu) this.fileMenu.at ??= event.local_position; })
-      .child(v_virtual_list(id, files.length, 42, index => files[index].path,
+    const virtualList = tree
+      ? v_virtual_list(listId, rows.length, 28, index => rows[index].key,
+        range => rows.slice(range.start, range.end).map(row => this.treeRow(row, t)))
+        .size_full().on_item_click((key, cx) => {
+          const row = byKey.get(key);
+          if (row?.kind === "dir") this.toggleDir(row.path, cx);
+          else if (row?.kind === "file") this.selectFile(row.file.path, cx);
+        })
+        .on_item_secondary_click((key, _event, cx) => {
+          const row = byKey.get(key);
+          this.fileMenu = row?.kind === "file" && !row.file.draftOnly ? { list: id, path: row.file.path, at: null } : null;
+          cx.notify();
+        })
+      : v_virtual_list(listId, files.length, 42, index => files[index].path,
         range => files.slice(range.start, range.end).map(f => this.fileRow(f, count(f.path), t, draftPaths.has(f.path))))
         .size_full().on_item_click((path, cx) => this.selectFile(path, cx))
         .on_item_secondary_click((path, _event, cx) => {
           this.fileMenu = files.some(f => f.path === path && !f.draftOnly) ? { list: id, path, at: null } : null; cx.notify();
-        }))
-      .child(Scrollbar.vertical(id).absolute().inset_0())
+        });
+    return v_flex().id(`${id}-frame`).relative().size_full().min_h(0)
+      .on_mouse_down("left", (_e, cx) => { if (this.fileMenu) { this.fileMenu = null; cx.notify(); } })
+      .on_mouse_down("right", event => { if (this.fileMenu) this.fileMenu.at ??= event.local_position; })
+      .child(virtualList)
+      .child(Scrollbar.vertical(listId).absolute().inset_0())
       .when(Boolean(menu && this.fileMenu.at), el => el.child(v_flex().id(`${id}-menu`).absolute()
         .left(Math.max(4, this.fileMenu.at.x - 4)).top(this.fileMenu.at.y + 2).w(190).p(4).gap(1)
         .rounded(7).bg(t.popover ?? t.surface).border_1().border_color(t.border)
@@ -1220,6 +1297,7 @@ export default class Annotator extends View {
   selectFile(path, cx, context = 3) {
     if (this.busy) return;
     this.reviewSend = null;
+    this.expandFileAncestors(path);
     this.focusReview();
     if (path === this.open) {
       this.view = "diff";
@@ -1292,11 +1370,15 @@ export default class Annotator extends View {
         }, true, "secondary"))));
   }
 
+  fileCode(file, t) {
+    const code = file.draftOnly ? "·" : file.status.includes("D") ? "D" : file.status.includes("A") || file.status === "??" ? "+" : "M";
+    return { code, color: code === "D" ? t.ansi1 : code === "+" ? t.ansi2 : t.ansi3 };
+  }
+
   fileRow(file, count, t, draft = false) {
     const path = pathParts(file.path), stats = fileStats(file);
     const active = file.path === this.open;
-    const code = file.draftOnly ? "·" : file.status.includes("D") ? "D" : file.status.includes("A") || file.status === "??" ? "+" : "M";
-    const color = code === "D" ? t.ansi1 : code === "+" ? t.ansi2 : t.ansi3;
+    const { code, color } = this.fileCode(file, t);
     return h_flex().id(`file-${file.path}`).h(42).flex_none().px(10).py(5).gap(8).items_center().cursor_pointer()
       .border_l(3).border_color(active ? t.accent : t.chrome)
       .bg(active ? t.selected : t.chrome).hover(s => s.bg(t.hover))
@@ -1311,6 +1393,31 @@ export default class Annotator extends View {
         .child(h_flex().gap(3)
           .when(draft, el => el.child(this.badge("Draft", t.accent, t.accent + "18")))
           .when(count > 0, el => el.child(this.badge(`${count} comment${count === 1 ? "" : "s"}`, t.accent, t.accent + "18")))));
+  }
+
+  treeRow(entry, t) {
+    const indent = 8 + Math.min(entry.depth, 8) * 12;
+    if (entry.kind === "dir") {
+      return h_flex().id(`dir-${entry.path}`).h(28).flex_none().pr(10).pl(indent).gap(5).items_center().cursor_pointer()
+        .border_l(3).border_color(t.chrome).bg(t.chrome).hover(s => s.bg(t.hover))
+        .child(div().w(12).flex_none().text_size(11).text_color(t.dim).child(entry.collapsed ? "▸" : "▾"))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().text_color(t.muted).child(entry.label))
+        .when(entry.collapsed && (entry.hasDraft || entry.commentCount > 0), el => el.child(h_flex().gap(3).items_center().flex_none()
+          .when(entry.hasDraft, el => el.child(this.badge("Draft", t.accent, t.accent + "18")))
+          .when(entry.commentCount > 0, el => el.child(this.badge(String(entry.commentCount), t.accent, t.accent + "18")))));
+    }
+    const file = entry.file, stats = fileStats(file), active = file.path === this.open;
+    const { code, color } = this.fileCode(file, t);
+    return h_flex().id(`file-${file.path}`).h(28).flex_none().pr(10).pl(indent).gap(6).items_center().cursor_pointer()
+      .border_l(3).border_color(active ? t.accent : t.chrome)
+      .bg(active ? t.selected : t.chrome).hover(s => s.bg(t.hover))
+      .child(h_flex().size(18).rounded(4).bg(color + "18").text_color(color).text_size(10.5).font_semibold().items_center().justify_center().flex_none().child(code))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().child(entry.name))
+      .child(h_flex().gap(4).items_center().flex_none()
+        .when(stats.added > 0, el => el.child(div().text_size(10.5).text_color(t.ansi2).child(`+${stats.added}`)))
+        .when(stats.removed > 0, el => el.child(div().text_size(10.5).text_color(t.ansi1).child(`−${stats.removed}`)))
+        .when(entry.draft, el => el.child(this.badge("Draft", t.accent, t.accent + "18")))
+        .when(entry.commentCount > 0, el => el.child(this.badge(String(entry.commentCount), t.accent, t.accent + "18"))));
   }
 
   codeRows(file, comments, t) {
@@ -1421,6 +1528,9 @@ export default class Annotator extends View {
           .child(this.button("sidebar-options", "⋯", cx => { this.reviewOptionsOpen = !this.reviewOptionsOpen; this.scopeMenuOpen = false; this.baseOpen = false; cx.notify(); }, true, this.reviewOptionsOpen ? "secondary" : "quiet").tooltip("View options")))
         .when(this.resolvedCount() > 0 || this.showResolved, el => el.child(h_flex().px(6).flex_none().bg(t.chrome).child(this.resolvedFilter("filter-resolved"))))
          .when(this.reviewOptionsOpen && this.view === "diff", el => el.child(h_flex().id("sidebar-options-panel").mx(6).my(4).p(5).gap(3).flex_wrap().flex_none().rounded(6).bg(t.surface).border_1().border_color(t.border)
+          .child(h_flex().gap(3).items_center()
+            .child(div().text_size(11).text_color(t.dim).px(4).child("Files"))
+            .child(this.fileViewToggle("sidebar-file-view")))
           .child(this.orderButton("order-logically"))
           .when(Boolean(this.orderEntry()?.files), el => el.child(this.button("reset-file-order", "Reset order", cx => this.resetOrder(cx))))))
          .child(h_flex().id("files-scope-row").min_h(35).flex_none().px(5).py(3).gap(3).items_center().bg(t.chrome)

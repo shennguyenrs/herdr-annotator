@@ -1,7 +1,7 @@
 import { div, list } from "gpui-kit";
 import { v_flex, h_flex, h_resizable, resizable_panel, v_virtual_list, Scrollbar, Textarea } from "gpui-base";
 import { theme, settings, setShared } from "herdr";
-import { splitRows, splitSelectionRow, selected, pendingComments, unreadItems, visibleComments, fileStats, diffReaderEntries, commentStatus, commentLocation, deliveryBlocker, reviewTargetReady, contextGaps, copiedSelection, reviewTotals } from "./review.js";
+import { splitRows, splitSelectionRow, selected, pendingComments, unreadItems, visibleComments, fileStats, diffReaderEntries, commentStatus, commentLocation, deliveryBlocker, reviewTargetReady, contextGaps, copiedSelection, reviewTotals, treeFileOrder } from "./review.js";
 
 function pageCards(self, id, items, render) {
   self.cardPages ??= new Map();
@@ -56,9 +56,10 @@ function inlineNote(comment, active, t, self) {
 export function renderFull(self, cx) {
   const t = theme(), font = settings().font ?? "JetBrains Mono";
   const data = self.data, snapshot = data?.snapshot, files = self.reviewFiles(snapshot), allComments = data?.comments ?? [];
+  const fileOrder = self.fileView === "tree" ? treeFileOrder(self.fileTree(files)) : files;
   const comments = visibleComments(allComments, self.showResolved);
   const draftPaths = self.draftPaths();
-  const file = files.find(f => f.path === self.open), fileIndex = files.indexOf(file);
+  const file = files.find(f => f.path === self.open), fileIndex = fileOrder.indexOf(file);
   const fileComments = comments.filter(c => c.path === self.open);
   const threads = visibleComments(self.github?.threads ?? [], self.showResolved);
   const counts = new Map(), marks = new Map();
@@ -171,8 +172,8 @@ export function renderFull(self, cx) {
           .when(Boolean(stats?.added), el => el.child(self.badge(`+${stats.added}`, t.ansi2)))
            .when(Boolean(stats?.removed), el => el.child(self.badge(`−${stats.removed}`, t.ansi1)))
            .when(Boolean(selection), el => el.child(self.button("copy-full-source-selection", "Copy lines", cx => self.copyText(copiedSelection(file, selection), cx))))
-          .child(self.button("full-prev-file", "‹", cx => self.selectFile(files[fileIndex - 1].path, cx), fileIndex > 0))
-          .child(self.button("full-next-file", "›", cx => self.selectFile(files[fileIndex + 1].path, cx), fileIndex >= 0 && fileIndex + 1 < files.length))
+          .child(self.button("full-prev-file", "‹", cx => self.selectFile(fileOrder[fileIndex - 1].path, cx), fileIndex > 0))
+          .child(self.button("full-next-file", "›", cx => self.selectFile(fileOrder[fileIndex + 1].path, cx), fileIndex >= 0 && fileIndex + 1 < fileOrder.length))
           .child(self.button("full-file-actions", "File ▾", cx => { self.fileActionsOpen = !self.fileActionsOpen; cx.notify(); })))
         .when(self.fileActionsOpen, el => el.child(h_flex().id("full-file-options").px(10).py(4).gap(4).flex_wrap().items_center()
           .child(self.button("full-context-more", "+20 context", cx => self.expandContext(Math.min(1000000, self.contextLines + 20), cx), Boolean(file) && self.contextLines < 1000000))
@@ -250,6 +251,9 @@ export function renderFull(self, cx) {
       .child(h_flex().items_center().gap(8)
         .child(div().flex_1().font_semibold().child("View options"))
         .child(self.button("full-options-close", "Done", cx => { self.reviewOptionsOpen = false; cx.notify(); })))
+      .child(h_flex().gap(6).flex_wrap().items_center()
+        .child(div().w(80).text_size(11).text_color(t.dim).child("Files"))
+        .child(self.fileViewToggle("full-file-view")))
       .child(h_flex().gap(6).flex_wrap().items_center()
         .child(div().w(80).text_size(11).text_color(t.dim).child("File order"))
         .child(self.orderButton("full-order-logically"))
